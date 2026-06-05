@@ -1,0 +1,28 @@
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: re-workers-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s 
+      timeout: 5s 
+      retries: 5 
+
+  jobs-master:
+    build:
+      context: ./jobs-master
+    container_name: re-workers-jobs-master
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./jobs-master/.env
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy

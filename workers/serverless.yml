@@ -1,0 +1,15 @@
+service: re-workers
+frameworkVersion: '4'
+provider:
+  name: aws  
+  runtime: nodejs22.x
+  region: us-east-2
+  profile: re-workers
+  deploymentBucket:
+    name: re-workers-serverless-deploy
+
+functions:
+  calculate: 
+    handler: handler.calculate
+    timeout: 30
+    memorySize: 256
