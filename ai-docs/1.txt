@@ -1,0 +1,621 @@
+
+Contexto de la ia (pdf de la E2)
+
+
+PROMPT 1
+
+
+Necesito construir una función AWS Lambda en Node.js que reciba una matriz de
+adyacencia, una ciudad origen y un criterio ("price" o "distance"), y retorne
+las rutas óptimas desde esa ciudad a todos los demás nodos usando el algoritmo
+de Dijkstra. Cada arista en la matriz tiene los campos: distance, transportCost
+y enabled. Si enabled es false, la arista debe ignorarse. La función debe
+exportarse como exports.calculate. ¿Cómo la implemento?
+
+RESPUESTA 1
+
+Perfecto punto de partida. Vamos paso a paso.
+
+La función Lambda en AWS recibe un objeto `event` con los datos del invocador
+y debe retornar un valor directamente (no hay res.json como en Express). La
+estructura que necesitas es esta:
+
+  // workers/handler.js
+  'use strict';
+
+  exports.calculate = async (event) => {
+    const { matrix, originCity, criteria } = event;
+
+    if (!matrix || !originCity || !criteria) {
+      throw new Error('Faltan campos requeridos: matrix, originCity, criteria');
+    }
+
+    const routes = dijkstraAllDestinations(matrix, originCity, criteria);
+    return { routes };
+  };
+
+Ahora la lógica de Dijkstra. Lo clave es que el criterio determina qué campo
+de la arista usar como peso:
+
+  function dijkstraAllDestinations(matrix, origin, criteria) {
+    const costField = criteria === 'price' ? 'transportCost' : 'distance';
+
+    // Recolectar todos los nodos del grafo (pueden aparecer como clave o como destino)
+    const allNodes = new Set([
+      ...Object.keys(matrix),
+      ...Object.values(matrix).flatMap((row) => Object.keys(row)),
+    ]);
+
+    // Inicializar distancias, predecesores y metadata
+    const dist = {}, prev = {}, firstHop = {}, hopsCount = {};
+    for (const node of allNodes) {
+      dist[node] = Infinity;
+      prev[node] = null;
+      firstHop[node] = null;
+      hopsCount[node] = 0;
+    }
+    dist[origin] = 0;
+
+    // Priority queue mínima simulada con array + sort
+    const pq = [[0, origin]];
+
+    while (pq.length > 0) {
+      pq.sort((a, b) => a[0] - b[0]);
+      const [currentCost, currentNode] = pq.shift();
+
+      // Si ya procesamos un camino más corto a este nodo, saltar
+      if (currentCost > dist[currentNode]) continue;
+
+      const neighbors = matrix[currentNode] || {};
+      for (const [neighbor, edge] of Object.entries(neighbors)) {
+        if (!edge.enabled) continue;                          // arista deshabilitada
+        const edgeCost = edge[costField];
+        if (edgeCost == null || edgeCost < 0) continue;      // arista inválida
+
+        const newCost = dist[currentNode] + edgeCost;
+        if (newCost < dist[neighbor]) {
+          dist[neighbor] = newCost;
+          prev[neighbor] = currentNode;
+          hopsCount[neighbor] = hopsCount[currentNode] + 1;
+          // firstHop guarda el primer salto desde origin (útil para routing tables)
+          firstHop[neighbor] = currentNode === origin ? neighbor : firstHop[currentNode];
+          pq.push([newCost, neighbor]);
+        }
+      }
+    }
+
+    // Reconstruir rutas para todos los destinos
+    const routes = {};
+    for (const dest of allNodes) {
+      if (dest === origin) continue;
+      if (dist[dest] === Infinity) {
+        routes[dest] = { reachable: false, routeMetricCost: null, hops: null, nextHop: null, path: [] };
+      } else {
+        const path = [];
+        let cur = dest;
+        while (cur !== null) { path.unshift(cur); cur = prev[cur]; }
+        routes[dest] = {
+          reachable: true,
+          routeMetricCost: dist[dest],
+          hops: hopsCount[dest],
+          nextHop: firstHop[dest],
+          path,
+        };
+      }
+    }
+    return routes;
+  }
+
+Puntos importantes a entender:
+
+1. `allNodes` incluye nodos que solo aparecen como destinos en la matriz pero
+   no como origen, así el grafo queda completo.
+
+2. `firstHop` resuelve el "next hop": el primer nodo al que debes ir desde
+   origin para llegar a cualquier destino. Útil para tablas de enrutamiento.
+
+3. La condición `if (currentCost > dist[currentNode]) continue` es la
+   optimización clásica de Dijkstra para evitar procesar nodos obsoletos que
+   quedaron en la cola.
+
+4. La Lambda no necesita dependencias externas. El archivo workers/package.json
+   puede estar vacío (sin dependencies). Eso simplifica el deploy.
+
+Guarda este archivo como workers/handler.js. En el siguiente paso lo desplegarás
+a AWS con Serverless Framework.
+
+
+
+PROMPT 2
+
+
+Ya tengo el handler.js con Dijkstra. Ahora necesito desplegarlo como una función
+Lambda en AWS usando Serverless Framework v4. El perfil AWS se llama "re-workers",
+la región es us-east-2, y necesito un bucket S3 preexistente para el deployment.
+¿Cómo configuro el serverless.yml y hago el deploy completo desde cero?
+
+RESPUESTA 2
+
+Bien. Serverless Framework v4 toma tu código, lo empaqueta en un ZIP, lo sube a
+S3 y crea/actualiza la infraestructura en AWS vía CloudFormation. Tú solo
+escribes el YAML declarativo.
+
+PASO 1 — Instalar Serverless Framework globalmente
+
+  npm install -g serverless
+  serverless -v   # debe mostrar Framework Core: 4.x.x
+
+PASO 2 — Configurar el perfil AWS CLI
+
+Serverless usa el perfil que le indiques para autenticarse. Configúralo así:
+
+  aws configure --profile re-workers
+  # Te pedirá: Access Key ID, Secret Access Key, region (us-east-2), output (json)
+
+Verifica que funciona:
+
+  aws sts get-caller-identity --profile re-workers
+  # Debe mostrar el Account ID de tu cuenta AWS
+
+PASO 3 — Crear el bucket S3 para deployment
+
+Serverless sube el ZIP ahí antes de crear la Lambda. El bucket debe existir:
+
+  aws s3 mb s3://re-workers-serverless-deploy \
+    --region us-east-2 \
+    --profile re-workers
+
+PASO 4 — Crear workers/serverless.yml
+
+Este es el archivo de configuración completo:
+
+  service: re-workers
+  frameworkVersion: '4'
+
+  provider:
+    name: aws
+    runtime: nodejs22.x
+    region: us-east-2
+    profile: re-workers
+    deploymentBucket:
+      name: re-workers-serverless-deploy
+
+  functions:
+    calculate:
+      handler: handler.calculate   # archivo handler.js, función exports.calculate
+      timeout: 30                  # segundos máximos (Dijkstra sobre ~17 nodos es muy rápido)
+      memorySize: 256              # MB asignados
+
+Cada campo importa:
+- `service`: nombre base del stack de CloudFormation (será "re-workers-dev")
+- `runtime: nodejs22.x`: versión de Node que corre en Lambda
+- `profile`: qué perfil de ~/.aws/credentials usar
+- `deploymentBucket`: evita que Serverless cree un bucket automático con nombre aleatorio
+- `handler: handler.calculate`: "archivo.función" — handler.js exporta calculate
+
+PASO 5 — Hacer el deploy
+
+  cd workers/
+  serverless deploy
+
+Serverless hace internamente:
+  1. Empaqueta handler.js en un ZIP
+  2. Sube el ZIP a s3://re-workers-serverless-deploy
+  3. Crea/actualiza el stack CloudFormation "re-workers-dev"
+  4. CloudFormation provisiona: IAM Role, Lambda Function, Log Group en CloudWatch
+
+Output esperado:
+
+  ✔ Service deployed to stack re-workers-dev
+
+  functions:
+    calculate: re-workers-dev-calculate (X.X kB)
+
+PASO 6 — Verificar que la función existe
+
+  aws lambda get-function \
+    --function-name re-workers-dev-calculate \
+    --region us-east-2 \
+    --profile re-workers
+
+PASO 7 — Probar la Lambda directamente
+
+  aws lambda invoke \
+    --function-name re-workers-dev-calculate \
+    --region us-east-2 \
+    --profile re-workers \
+    --payload '{"matrix":{"A":{"B":{"distance":10,"transportCost":5,"enabled":true}}},"originCity":"A","criteria":"distance"}' \
+    --cli-binary-format raw-in-base64-out \
+    output.json
+
+  cat output.json
+  # {"routes":{"B":{"reachable":true,"routeMetricCost":10,"hops":1,"nextHop":"B","path":["A","B"]}}}
+
+Si necesitas actualizar solo el código sin tocar infraestructura (más rápido):
+
+  serverless deploy function -f calculate
+
+Para destruir todo el stack cuando ya no lo necesites:
+
+  serverless remove
+
+Con esto tienes tu Lambda `re-workers-dev-calculate` desplegada y funcionando.
+El siguiente paso es construir el servicio que la invoca de forma asíncrona.
+
+
+
+PROMPT 3
+
+
+Ahora necesito construir el servicio "jobs-master" en Node.js. Este servicio
+debe recibir solicitudes de cálculo de rutas, encolarlas en Redis usando Bull,
+y procesarlas de forma asíncrona invocando la Lambda que ya desplegué. ¿Cómo
+configuro Bull con Redis y creo la cola de trabajo?
+
+RESPUESTA 3
+
+Bull es una librería de colas de trabajo para Node.js que usa Redis como backend.
+La idea es simple: el productor (tu API) agrega jobs a la cola, y el consumidor
+(el worker) los procesa en background. Redis persiste los jobs y maneja la
+concurrencia.
+
+PASO 1 — Inicializar el proyecto jobs-master
+
+  mkdir jobs-master && cd jobs-master
+  npm init -y
+
+Instala las dependencias:
+
+  npm install bull express uuid dotenv @aws-sdk/client-lambda ioredis
+
+- `bull`: la librería de colas (usa Redis internamente)
+- `express`: el servidor HTTP
+- `uuid`: para generar IDs únicos por job
+- `dotenv`: para cargar variables de entorno desde .env
+- `@aws-sdk/client-lambda`: para invocar la Lambda desde el worker
+- `ioredis`: cliente Redis (Bull lo usa internamente, pero conviene tenerlo explícito)
+
+PASO 2 — Crear jobs-master/src/queue.js
+
+Este archivo crea la instancia de la cola y registra listeners de eventos:
+
+  'use strict';
+  require('dotenv').config({ override: false });
+  const Bull = require('bull');
+
+  // Bull(queueName, redisUrl)
+  // queueName: nombre lógico — los producers y consumers deben usar el mismo
+  // redisUrl: conexión a Redis; en Docker el hostname es el nombre del servicio
+  const routeQueue = new Bull('route-calculation', process.env.REDIS_URL);
+
+  routeQueue.on('error', (err) => {
+    console.error('[Queue] Error Redis:', err.message);
+  });
+
+  routeQueue.on('completed', (job) => {
+    console.log(`[Queue] Job ${job.id} completado`);
+  });
+
+  routeQueue.on('failed', (job, err) => {
+    console.error(`[Queue] Job ${job.id} falló: ${err.message}`);
+  });
+
+  module.exports = { routeQueue };
+
+Puntos clave sobre Bull:
+
+- Un job tiene estados: waiting → active → completed | failed
+- Bull garantiza que un job se procesa exactamente una vez (no hay duplicados)
+- Si el proceso muere mientras procesa un job, Bull lo re-encola automáticamente
+- `routeQueue.add(data, opts)` retorna una promesa con el job creado
+- `job.id` es el identificador que puedes usar para consultar el estado después
+- Puedes pasar `{ jobId: uuidv4() }` en opts para usar tu propio ID en lugar
+  del autoincremental de Bull
+
+PASO 3 — Crear el archivo .env
+
+  # jobs-master/.env
+  REDIS_URL=redis://localhost:6379
+  AWS_REGION=us-east-2
+  AWS_ACCESS_KEY_ID=tu_access_key
+  AWS_SECRET_ACCESS_KEY=tu_secret_key
+  LAMBDA_FUNCTION_NAME=re-workers-dev-calculate
+  PORT=3000
+
+En Docker, REDIS_URL será `redis://redis:6379` (el hostname es el nombre del
+servicio en docker-compose).
+
+PASO 4 — Verificar que Redis corre localmente (para desarrollo)
+
+  docker run -d -p 6379:6379 redis:7-alpine
+
+  # Verificar conexión
+  docker exec -it <container_id> redis-cli ping
+  # PONG
+
+Con la cola lista, el siguiente paso es construir la API Express que recibe
+las solicitudes y el worker que las procesa invocando la Lambda.
+
+
+PROMPT 4
+
+
+Tengo la cola Bull configurada. Ahora necesito construir la API Express del
+jobs-master con tres endpoints: GET /heartbeat para saber si el servicio está
+vivo, POST /job para encolar un trabajo de cálculo de rutas y retornar un jobId,
+y GET /job/:id para consultar el estado y resultado de un job. ¿Cómo lo
+implemento?
+
+RESPUESTA 4
+
+Perfecto. La API Express actúa como productor de la cola: recibe requests HTTP,
+los convierte en jobs de Bull y devuelve el ID para que el cliente pueda hacer
+polling. Los resultados los escribe el worker (paso siguiente), Bull los persiste
+en Redis, y la API los lee cuando el cliente consulta.
+
+Crea jobs-master/src/index.js:
+
+  'use strict';
+  require('dotenv').config({ override: false });
+
+  const express = require('express');
+  const { v4: uuidv4 } = require('uuid');
+  const { routeQueue } = require('./queue');
+  require('./worker'); // registra el processor — sin esto la cola no tiene consumidor
+
+  const app = express();
+  app.use(express.json());
+
+  // GET /heartbeat
+  // Retorna { status: true } si el servicio está operativo
+  app.get('/heartbeat', (req, res) => {
+    res.json({ status: true });
+  });
+
+  // POST /job
+  // Body: { matrix, originCity, criteria }
+  // Retorna: { jobId }
+  app.post('/job', async (req, res) => {
+    const { matrix, originCity, criteria } = req.body;
+
+    if (!matrix || !originCity || !criteria) {
+      return res.status(400).json({ error: 'Faltan campos: matrix, originCity, criteria' });
+    }
+
+    const jobId = uuidv4();
+
+    // routeQueue.add(data, opts)
+    // data: el objeto que recibirá el worker cuando procese este job
+    // opts.jobId: usamos nuestro UUID para poder recuperarlo luego por ID conocido
+    const job = await routeQueue.add({ matrix, originCity, criteria }, { jobId });
+
+    console.log(`[API] Job creado: ${job.id}`);
+    res.status(201).json({ jobId: job.id });
+  });
+
+  // GET /job/:id
+  // Retorna: { id, status, result, failedReason, createdAt, finishedAt }
+  app.get('/job/:id', async (req, res) => {
+    // routeQueue.getJob(id) busca el job en Redis por su ID
+    // Retorna null si no existe o si ya fue limpiado (Bull expira jobs completados)
+    const job = await routeQueue.getJob(req.params.id);
+
+    if (!job) {
+      return res.status(404).json({ error: 'Job no encontrado' });
+    }
+
+    // job.getState() retorna: 'waiting' | 'active' | 'completed' | 'failed' | 'delayed'
+    const state = await job.getState();
+
+    res.json({
+      id: job.id,
+      status: state,
+      result: job.returnvalue || null,      // el valor retornado por el worker
+      failedReason: job.failedReason || null,
+      createdAt: new Date(job.timestamp).toISOString(),
+      finishedAt: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
+    });
+  });
+
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`[JobsMaster] Corriendo en puerto ${PORT}`);
+  });
+
+El flujo completo del cliente es:
+
+  1. POST /job → recibe { jobId: "abc-123" }
+  2. GET /job/abc-123 → { status: "waiting" }   (el job está en cola)
+  3. GET /job/abc-123 → { status: "active" }    (el worker lo está procesando)
+  4. GET /job/abc-123 → { status: "completed", result: { routes: {...} } }
+
+Observaciones importantes:
+
+- `require('./worker')` en index.js es intencional: importar el archivo registra
+  el processor en la cola. Sin esto, los jobs quedarán en estado "waiting" para
+  siempre porque nadie los consume.
+
+- `job.returnvalue` contiene lo que retornó la función del processor (el worker).
+  Bull lo persiste en Redis automáticamente cuando el job se completa.
+
+- El jobId personalizado (UUID) es necesario para poder hacer `getJob(id)` luego.
+  Sin él, Bull asigna IDs autoincrement (1, 2, 3...) que son difíciles de compartir
+  entre el cliente y la API.
+
+Agrega el script de start en package.json:
+
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  }
+
+El worker (que invoca la Lambda) va en el siguiente paso.
+
+
+
+PROMPT 5
+
+
+Necesito implementar el worker que consume la cola Bull y, por cada job, invoca
+la Lambda de Dijkstra usando AWS SDK v3. También necesito contenerizar el
+jobs-master con Docker y orquestar Redis + jobs-master con docker-compose.
+¿Cómo lo hago todo junto?
+
+RESPUESTA 5
+
+Vamos por partes. El worker es el consumidor de la cola: registra un processor
+que Bull llama automáticamente cuando hay jobs disponibles. El resultado que
+retorne el processor queda guardado en Redis como `job.returnvalue`.
+
+PARTE A — Worker: jobs-master/src/worker.js
+
+  'use strict';
+  require('dotenv').config();
+
+  const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
+  const { routeQueue } = require('./queue');
+
+  // LambdaClient se inicializa una sola vez (es thread-safe y reutilizable)
+  const lambda = new LambdaClient({ region: process.env.AWS_REGION });
+
+  // routeQueue.process(concurrency, handler)
+  // concurrency: cuántos jobs puede procesar en paralelo este proceso
+  // handler: función async que recibe el job — lo que retorna se guarda en job.returnvalue
+  routeQueue.process(2, async (job) => {
+    console.log(`[Worker] Procesando job ${job.id}`, job.data);
+
+    const payload = {
+      matrix: job.data.matrix,
+      originCity: job.data.originCity,
+      criteria: job.data.criteria,
+    };
+
+    // InvokeCommand invoca la Lambda de forma síncrona (RequestResponse)
+    // y espera a que retorne el resultado de Dijkstra
+    const command = new InvokeCommand({
+      FunctionName: process.env.LAMBDA_FUNCTION_NAME,
+      InvocationType: 'RequestResponse',
+      Payload: Buffer.from(JSON.stringify(payload)),
+    });
+
+    const response = await lambda.send(command);
+
+    // Lambda retorna el resultado en response.Payload como Uint8Array
+    const resultText = Buffer.from(response.Payload).toString('utf-8');
+    const result = JSON.parse(resultText);
+
+    // Si Lambda lanzó una excepción no capturada, viene como errorMessage
+    if (result.errorMessage) {
+      throw new Error(`Lambda error: ${result.errorMessage}`);
+    }
+
+    // El valor retornado aquí se convierte en job.returnvalue en Redis
+    return result;
+  });
+
+  console.log('[Worker] Escuchando jobs en la cola route-calculation...');
+
+Puntos clave:
+
+- Si el processor lanza una excepción, Bull marca el job como "failed" y guarda
+  el mensaje en `job.failedReason`. No necesitas manejar eso manualmente.
+- `InvocationType: 'RequestResponse'` hace la invocación síncrona: el worker
+  espera a que Dijkstra termine antes de continuar.
+- La concurrencia de 2 significa que este proceso puede tener 2 jobs activos
+  simultáneamente. Ajústala según el throughput que necesites.
+
+PARTE B — Dockerfile para jobs-master
+
+  FROM node:22-alpine
+
+  WORKDIR /app
+
+  COPY package.json package-lock.json ./
+  RUN npm install --omit=dev
+
+  COPY src/ ./src/
+
+  EXPOSE 3000
+
+  CMD ["node", "src/index.js"]
+
+El flag `--omit=dev` excluye nodemon y otras devDependencies del contenedor
+de producción, reduciendo el tamaño de la imagen.
+
+PARTE C — docker-compose.yml (en la raíz del proyecto)
+
+  services:
+
+    redis:
+      image: redis:7-alpine
+      container_name: re-workers-redis
+      restart: unless-stopped
+      ports:
+        - "6379:6379"
+      healthcheck:
+        test: ["CMD", "redis-cli", "ping"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+
+    jobs-master:
+      build:
+        context: ./jobs-master
+      container_name: re-workers-jobs-master
+      restart: unless-stopped
+      ports:
+        - "3000:3000"
+      env_file:
+        - ./jobs-master/.env
+      environment:
+        REDIS_URL: redis://redis:6379       # sobreescribe el .env para Docker
+      depends_on:
+        redis:
+          condition: service_healthy        # espera que Redis responda al ping
+
+El `healthcheck` en Redis garantiza que jobs-master no intente conectarse antes
+de que Redis esté listo. Sin eso, Bull podría fallar al iniciar si Redis demora.
+
+PARA LEVANTAR TODO:
+
+  docker compose up --build
+
+PARA PROBAR EL FLUJO COMPLETO:
+
+  # 1. Encolar un job
+  curl -X POST http://localhost:3000/job \
+    -H "Content-Type: application/json" \
+    -d '{"matrix":{"A":{"B":{"distance":10,"transportCost":5,"enabled":true}}},"originCity":"A","criteria":"distance"}'
+  # → { "jobId": "abc-123-..." }
+
+  # 2. Consultar el estado
+  curl http://localhost:3000/job/abc-123-...
+  # → { "status": "completed", "result": { "routes": { "B": { ... } } } }
+
+  # 3. Verificar que el servicio está vivo
+  curl http://localhost:3000/heartbeat
+  # → { "status": true }
+
+ESTRUCTURA FINAL DEL PROYECTO:
+
+  re-workers/
+  ├── docker-compose.yml
+  ├── docs/
+  │   └── serverless.md
+  ├── workers/
+  │   ├── handler.js          ← Lambda: Dijkstra
+  │   └── serverless.yml      ← config de Serverless Framework
+  └── jobs-master/
+      ├── Dockerfile
+      ├── package.json
+      ├── .env
+      └── src/
+          ├── index.js        ← Express API: /heartbeat, /job, /job/:id
+          ├── queue.js        ← instancia de Bull + Redis
+          └── worker.js       ← consumer: invoca Lambda por cada job
+
+Con esto tienes el sistema completo: la Lambda corre Dijkstra en AWS, la cola
+Bull gestiona los trabajos en Redis, y la API Express permite encolar cálculos
+y consultar resultados de forma asíncrona. Todo el entorno local corre con un
+solo `docker compose up`.
+
