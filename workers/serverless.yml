@@ -1,15 +1,32 @@
 service: re-workers
 frameworkVersion: '4'
 provider:
-  name: aws  
+  name: aws
   runtime: nodejs22.x
   region: us-east-2
   profile: re-workers
   deploymentBucket:
     name: re-workers-serverless-deploy
+  environment:
+    MASTER_URL: ${env:MASTER_URL, 'https://REEMPLAZAR-CON-URL-DEL-BACKEND'}
 
 functions:
-  calculate: 
+  calculate:
     handler: handler.calculate
     timeout: 30
     memorySize: 256
+
+  checkSubscription:
+    handler: subscriptionHandler.checkSubscription
+    timeout: 15
+    memorySize: 128
+
+  sendSubscriptionPackage:
+    handler: subscriptionHandler.sendSubscriptionPackage
+    timeout: 30
+    memorySize: 128
+
+  completeSubscription:
+    handler: subscriptionHandler.completeSubscription
+    timeout: 10
+    memorySize: 128
